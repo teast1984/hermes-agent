@@ -501,6 +501,46 @@ def _terminate_reclaimed_worker(
     return info
 
 
+def _worker_scope_unit_suffix(task_id: str, run_id: int) -> str:
+    """``kanban-<task>-run-<run>`` — the ``unit_suffix`` a kanban worker's
+    transient scope is named with (see ``_restart_safe_worker_argv``). Kept in
+    one place so teardown re-derives exactly the name the spawn minted."""
+    return f"kanban-{task_id}-run-{run_id}"
+
+
+def _closed_run_scope_unit(task_id: str, run_id: int) -> str:
+    """The transient-scope unit a worker for *task_id*'s *run_id* ran under
+    (``hermes-worker-kanban-<task>-run-<run>.scope``). The spawn path never
+    retains the name, so teardown rebuilds it from the closed ``task_runs``
+    row's own (task_id, run_id)."""
+    return f"hermes-worker-{_worker_scope_unit_suffix(task_id, run_id)}.scope"
+
+
+def _teardown_closed_run_scope(task_id: str, run_id: int) -> Optional[str]:
+    """Stop a finished run's transient systemd scope (best-effort).
+
+    A worker that exits normally can leave a double-forked descendant (an HTTP
+    server) reparented inside the scope's cgroup; ``systemd-run --collect`` only
+    collects an EMPTY scope, so the scope and its bound socket outlive the run.
+    The run is over and its worker is confirmed gone, so tear the cgroup down
+    (SIGTERM-all, SIGKILL after ``TimeoutStopSec``) — the parent-first signal
+    already handled the worker; this is the no-orphans backstop. Scopes are only
+    ever created when this process runs inside a systemd unit
+    (``restart_safe_gateway_child_argv`` requires ``INVOCATION_ID``), so gate on
+    the same marker to stay a no-op elsewhere. Returns the unit stopped, or None
+    when no scope could have existed / the stop failed."""
+    if not os.environ.get("INVOCATION_ID"):
+        return None
+    try:
+        from tools.process_registry import _stop_systemd_unit
+    except Exception:
+        return None
+    unit = _closed_run_scope_unit(task_id, run_id)
+    if _stop_systemd_unit(unit):
+        return unit
+    return None
+
+
 def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
     """End host-local workers that outlived their run (issue #111791) — a worker
     that called ``kanban_complete`` and then hung keeps its ``state.db`` sidecar
@@ -544,6 +584,12 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
             pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint)
         if not termination["terminated"]:
             return  # still alive: try again next tick
+    # The run is over and its worker is confirmed gone (signalled and reaped
+    # above, or already exited normally). A descendant that survived inside the
+    # worker's systemd scope keeps the scope alive after ``--collect`` could
+    # collect it; tear the scope down so the leaked server cannot outlive the
+    # finished run.
+    stopped_scope = _teardown_closed_run_scope(row["task_id"], row["id"])
     with _kb.write_txn(conn):
         conn.execute(
             "UPDATE task_runs SET worker_pid = NULL, worker_started_at = NULL "
@@ -553,7 +599,14 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
         if alive:
             _kb._append_event(
                 conn, row["task_id"], "terminal_worker_reaped",
-                {"pid": pid, "worker_started_at": fingerprint, **termination}, run_id=row["id"],
+                {"pid": pid, "worker_started_at": fingerprint, **termination,
+                 **({"systemd_scope_stopped": stopped_scope} if stopped_scope else {})},
+                run_id=row["id"],
+            )
+        elif stopped_scope:
+            _kb._append_event(
+                conn, row["task_id"], "run_scope_reaped",
+                {"systemd_scope_stopped": stopped_scope}, run_id=row["id"],
             )
     if alive:
         reaped.append(row["task_id"])
@@ -2752,7 +2805,7 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
 
     return restart_safe_gateway_child_argv(
         command,
-        unit_suffix=f"kanban-{task.id}-run-{task.current_run_id}",
+        unit_suffix=_worker_scope_unit_suffix(task.id, task.current_run_id),
         require_restart_safe_scope=True,
         outlives_parent=True,
     ).argv
