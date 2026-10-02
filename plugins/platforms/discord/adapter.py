@@ -2075,7 +2075,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         retry_after = max(1.0, float(retry_after))
         self._update_command_sync_entry(
             app_id, fingerprint, keep_existing=True,
-            fields=lambda now: {"retry_after_until": time.time() + retry_after, "retry_after": retry_after},
+            fields=lambda now: {"retry_after_until": now + retry_after, "retry_after": retry_after},
         )
 
     def _record_command_sync_success(self, app_id: Any, fingerprint: str, summary: dict) -> None:
@@ -2196,7 +2196,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     retry_after = _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS
                 self._record_command_sync_rate_limit(app_id, fingerprint, retry_after)
                 logger.warning(
-                    "[%s] Discord rate-limited slash command sync; retrying after %.0fs", self.name,
+                    "[%s] Discord rate-limited slash command sync; suppressing sync attempts for %.0fs; will retry on next reconnect", self.name,
                     retry_after,
                 )
                 return

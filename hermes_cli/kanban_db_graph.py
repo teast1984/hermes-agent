@@ -166,6 +166,11 @@ def decompose_triage_task(
     return child_ids
 
 
+# Default runtime ceiling (seconds) applied to every auto-decomposed child
+# card; per-child override: "max_runtime_seconds" key in the child dict.
+DECOMPOSED_CHILD_MAX_RUNTIME_SECONDS = 1800
+
+
 def _insert_decomposed_child(
     conn: sqlite3.Connection, root_id: str, root_row: sqlite3.Row, child: dict,
     author: Optional[str], now: int,
@@ -196,15 +201,24 @@ def _insert_decomposed_child(
         child_ws_path = None
     new_id = _new_task_id()
     body = child.get("body")
+    # Default runtime ceiling for decomposed children: the decomposer cannot
+    # know each child's role, so default to the research-tier ceiling
+    # (hermes-kanban-reliability). Without this, decomposed cards get NULL
+    # max_runtime_seconds and an alive-but-stuck worker can hold them for
+    # hours (observed: t_a662b13c, 16.6h). A child dict may override via an
+    # optional "max_runtime_seconds" key (validated positive int).
+    child_max_runtime = child.get("max_runtime_seconds")
+    if not isinstance(child_max_runtime, int) or child_max_runtime <= 0:
+        child_max_runtime = DECOMPOSED_CHILD_MAX_RUNTIME_SECONDS
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, max_runtime_seconds) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
             _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
+            root_row["tenant"], now, (author or "decomposer"), child_max_runtime,
         ),
     )
     _append_event(
